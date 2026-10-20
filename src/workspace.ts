@@ -319,22 +319,8 @@ export class WorkspaceSnapshots {
       return false
     }
     try {
-      let root: string
-      try {
-        const { stdout } = await execFileAsync('git', ['-C', cwd, 'rev-parse', '--show-toplevel'], { encoding: 'utf8' })
-        root = resolve(stdout.trim())
-      } catch (error) {
-        // Not inside any repository: give the workspace its own repository so
-        // snapshots keep working (the user-facing decision: auto `git init`).
-        if (isDriveRoot(resolve(cwd))) {
-          this.unavailable = '工作目录是盘符根目录,为安全起见不做文件快照,本次只回退了对话。'
-          return false
-        }
-        await execFileAsync('git', ['-C', cwd, 'init', '-q'], { encoding: 'utf8' })
-        this.options.logger.warn(`[dsh-session-manager] 工作区不是 git 仓库,已自动执行 git init:${cwd}`)
-        const retry = await execFileAsync('git', ['-C', cwd, 'rev-parse', '--show-toplevel'], { encoding: 'utf8' })
-        root = resolve(retry.stdout.trim())
-      }
+      const { stdout } = await execFileAsync('git', ['-C', cwd, 'rev-parse', '--show-toplevel'], { encoding: 'utf8' })
+      const root = resolve(stdout.trim())
       if (isInside(this.options.storeRoot, root)) {
         // The mirror would snapshot its own objects and corrupt itself.
         this.unavailable = '工作区快照目录位于当前仓库内,已跳过文件回退,本次只回退了对话。'
@@ -562,10 +548,4 @@ export function callSeqForCall(events: readonly WorkspaceEvent[], callId: string
 function isInside(child: string, parent: string): boolean {
   const rel = relative(parent, resolve(child))
   return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel))
-}
-
-/** Whether a path is a filesystem root (e.g. `C:\`) — never snapshot those. */
-function isDriveRoot(path: string): boolean {
-  const parsed = resolve(path)
-  return parsed === parsed.slice(0, 3) && /^[A-Za-z]:\\?$/.test(parsed)
 }
