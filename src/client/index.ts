@@ -16,6 +16,8 @@ import type { SessionId } from '@deepseek-ai/dsh-api-remotes/client'
 import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
 // Type-only: brings the `sidebar.footer.action` SlotMap declaration into this program.
 import type {} from '@deepseek-ai/dsh-client-ui-sidebar/client'
+// Type-only: brings the sidebar session menu's SlotMap declaration into this program.
+import type {} from '@deepseek-ai/dsh-client-ui-workspace/client'
 // Type-only: brings the ctx.locale Context merge into this program.
 import type {} from '@deepseek-ai/dsh-client-locale/client'
 // Type-only: brings the conversation header slots' SlotMap declaration.
@@ -450,6 +452,29 @@ const STYLE = `
 }
 .dsh-row-action--danger:hover:not(:disabled) {
   border-color: var(--dsw-alias-state-danger-border, #ef4444);
+}
+/* Row in the official sidebar session "⋯" menu. */
+.dsh-session-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 36px;
+  padding: 8px 10px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--dsw-alias-label-primary, #0f1115);
+  font-size: 13px;
+  line-height: 1.4;
+  text-align: left;
+  cursor: pointer;
+}
+.dsh-session-menu-item:hover:not(:disabled) {
+  background: var(--dsw-alias-interactive-bg-hover, rgba(0, 0, 0, .06));
+}
+.dsh-session-menu-item--danger {
+  color: var(--dsw-alias-state-danger-border, #ef4444);
 }
 /* Per-row "More" popover menu (self-drawn). */
 .dsh-delete-session__more-wrap {
@@ -922,11 +947,13 @@ function stringsOf() {
         count: (used: number) => `${used} 个会话`,
         current: '当前会话',
         delete: '删除',
+        menuDelete: '删除会话',
         deleting: '删除中…',
         confirm: '确定删除会话「{title}」吗？它会移入回收站，可在「回收站」中恢复或彻底删除。',
         deleted: '已删除会话「{title}」',
         failed: '删除会话「{title}」失败',
         liveError: '（会话正在使用中，请先停止后再删）',
+        childLiveError: '（子代理会话正在运行，请稍后重试）',
         notFoundError: '（会话不存在或已被删除）',
         running: '运行中',
         archived: '已归档',
@@ -1014,11 +1041,13 @@ function stringsOf() {
         count: (used: number) => `${used} sessions`,
         current: 'current session',
         delete: 'Delete',
+        menuDelete: 'Delete session',
         deleting: 'Deleting…',
         confirm: 'Delete session "{title}"? It moves to the trash, where you can restore or permanently delete it.',
         deleted: 'Deleted session "{title}"',
         failed: 'Failed to delete session "{title}"',
         liveError: ' (session is in use; stop it before deleting)',
+        childLiveError: ' (a subagent session is still running)',
         notFoundError: ' (session does not exist or was already deleted)',
         running: 'running',
         archived: 'archived',
@@ -2253,6 +2282,50 @@ export function apply(ctx: ClientContext): void {
       disposers.forEach((dispose) => dispose())
     }
   })
+
+  // Sidebar session menu ("⋯"): delete one session. The settings drawer is not
+  // mounted here, so only the official list is re-pulled afterwards.
+  const deleteSessionFromMenu = (sessionId: string, title: string): void => {
+    const strings = stringsOf()
+    if (!window.confirm(strings.confirm.replace('{title}', title))) return
+    saveTitle(sessionId, title)
+    void (async () => {
+      try {
+        const response = await fetch(DELETE_ROUTE, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ sessionId }),
+        })
+        const data = (await response.json().catch(() => ({}))) as ActionResultResponse
+        if (!response.ok || data.ok !== true) throw new Error(data.error ?? `HTTP ${response.status}`)
+      } catch (error) {
+        const code = error instanceof Error ? error.message : ''
+        const friendly = code === 'session-live'
+          ? strings.liveError
+          : code === 'child-live'
+            ? strings.childLiveError
+            : code === 'not-found'
+              ? strings.notFoundError
+              : ''
+        window.alert(strings.failed.replace('{title}', title) + (friendly !== '' ? friendly : code !== '' ? ` (${code})` : ''))
+        return
+      }
+      // Full re-pull: a cold session leaves no removal frame, and the official
+      // subagent catalog keeps tracking the deleted parent's children.
+      try {
+        await (sessions as unknown as { refresh?: () => Promise<unknown> }).refresh?.()
+      } catch {
+        // Best-effort; the next list refresh re-baselines anyway.
+      }
+    })()
+  }
+
+  ctx.slots.inject('sidebar.workspaces.session.menu.item', () => ctx.slots.register({
+    name: 'sidebar.workspaces.session.menu.item',
+    id: 'dsh-delete-session-menu',
+    order: 410,
+    inject: () => ({ deleteSession: deleteSessionFromMenu }),
+  }, SidebarDeleteMenuItem))
 }
 
 interface ClientContext {
@@ -2304,6 +2377,40 @@ function DeleteCurrentButton({ sessionId }: DeleteCurrentButtonProps): ReactElem
     onClick: handleClick,
     children: strings.deleteCurrent,
   })
+}
+
+// ── Sidebar session "⋯" menu: delete ────────────────────────────────────────
+
+/** Owner props plus the injected action for one sidebar session menu row. */
+interface SidebarDeleteMenuItemProps {
+  /** Session the row's menu belongs to. */
+  sessionId: string
+  /** Row display title (persisted title, or empty). */
+  displayTitle: string
+  /** The menu's open-state pair, supplied by the slot owner. */
+  useMenuOpenState: () => [boolean, (open: boolean) => void]
+  /** Deletes one session through the trash route, then re-pulls the list. */
+  deleteSession: (sessionId: string, title: string) => void
+}
+
+/**
+ * "Delete session" row in the official sidebar session menu, placed after the
+ * shipped archive row (400) and before the session-id row (450). The row only
+ * dismisses the menu and delegates: the host route owns archiving, the trash
+ * entry and the subagent cascade.
+ */
+function SidebarDeleteMenuItem({ sessionId, displayTitle, useMenuOpenState, deleteSession }: SidebarDeleteMenuItemProps): ReactElement {
+  const strings = useLocaleStrings()
+  const [, setMenuOpen] = useMenuOpenState()
+  return createElement('button', {
+    type: 'button',
+    role: 'menuitem',
+    className: 'dsh-session-menu-item dsh-session-menu-item--danger',
+    onClick: () => {
+      setMenuOpen(false)
+      deleteSession(sessionId, displayTitle)
+    },
+  }, createElement(TrashIcon, { size: 14 }), createElement('span', null, strings.menuDelete))
 }
 
 // ── General-settings preference row: context compaction threshold ──────────

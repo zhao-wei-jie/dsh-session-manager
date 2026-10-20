@@ -8,8 +8,10 @@
  *   GET  /dsh-session-manager/trash                          -> list trash entries
  *
  * Delete flow (soft delete):
- *  1. Resolve the persisted session; refuse sessions whose agent is actively
- *     running a turn.
+ *  0. Refuse when the session, or any subagent session reachable from its
+ *     catalog, is actively running a turn.
+ *  1. Trash every reachable subagent session deepest-first, then the session
+ *     itself (same archive + move + trash-entry path for all of them).
  *  2. Move the session's artifact directory into the plugin trash folder
  *     (a blank session without an artifact just records the entry).
  *  3. Archive the session so every client hides the row immediately.
@@ -84,6 +86,52 @@ function compatHeader(item: unknown): StoredHeader {
 function locateSession(ctx: Context, meta: StoredHeader): { path: string } | undefined {
   const persistence = ctx.sessionPersistence as unknown as { locate?(meta: StoredHeader): { path: string } | undefined }
   return persistence.locate?.(meta)
+}
+
+/** One session's trash outcome: success, or an HTTP status plus a stable code. */
+type TrashOutcome = { ok: true } | { ok: false; status: number; error: string }
+
+/** A row of `ctx.subagents.listDescendants` (only the fields this route reads). */
+interface DescendantRow {
+  id: string
+  kind: string
+  depth?: number
+  activity?: string
+}
+
+/**
+ * Subagent sessions reachable from one parent catalog, deepest first.
+ *
+ * The cascade runs before the parent, so a running descendant refuses the whole
+ * batch instead of leaving an orphan log behind. A composition without the
+ * subagent service — or a catalog that cannot be read — degrades to a
+ * parent-only delete, which is the behaviour this route had before the cascade.
+ */
+async function subagentDescendants(
+  ctx: Context,
+  rootId: SessionId,
+): Promise<{ ok: true; ids: SessionId[] } | { ok: false; status: number; error: string }> {
+  // Optional service: a composition without subagents keeps the parent-only
+  // delete, and a scoped context that refuses the lookup must not break it.
+  let subagents: { listDescendants?(root: string, signal?: AbortSignal): Promise<readonly DescendantRow[]> } | undefined
+  try {
+    subagents = ctx.get('subagents') as typeof subagents
+  } catch {
+    subagents = undefined
+  }
+  if (subagents?.listDescendants === undefined) return { ok: true, ids: [] }
+  let rows: readonly DescendantRow[]
+  try {
+    rows = await subagents.listDescendants(rootId)
+  } catch (error) {
+    ctx.logger.warn('[dsh-session-manager] descendant catalog unavailable; deleting the parent only:', error)
+    return { ok: true, ids: [] }
+  }
+  const children = rows
+    .filter((row) => row.kind === 'child')
+    .sort((a, b) => (b.depth ?? 0) - (a.depth ?? 0))
+  if (children.some((row) => row.activity === 'running')) return { ok: false, status: 409, error: 'child-live' }
+  return { ok: true, ids: children.map((row) => row.id as SessionId) }
 }
 
 const ROUTE_PREFIX = '/dsh-session-manager'
@@ -423,7 +471,110 @@ function setup(ctx: Context): Promise<() => Promise<void>> {
       }, { prepend: true })
     }
 
+    /**
+     * Archive one session and move its artifact into the trash.
+     *
+     * Shared by the subagent cascade and the parent: one archive/move/record
+     * implementation and one rollback, so a child and a parent are trashed
+     * exactly alike.
+     *
+     * @param id - session to trash.
+     * @param headers - persistence headers read once per delete batch.
+     * @returns success, or an HTTP status plus a stable error code.
+     */
+    const trashOne = async (id: SessionId, headers: readonly StoredHeader[]): Promise<TrashOutcome> => {
+      const meta = headers.find((header) => header.id === id)
+      const agent = ctx.agents.get(id)
+      const live = agent !== undefined
+
+      if (agent?.status === 'running') return { ok: false, status: 409, error: 'session-live' }
+
+      let originalPath: string | undefined
+      if (meta !== undefined) {
+        const location = locateSession(ctx, meta)
+        if (location === undefined) return { ok: false, status: 500, error: 'no-artifact-location' }
+        originalPath = dirname(location.path)
+      }
+
+      const workspace = ctx.storageDomain.get('workspace')
+      const wasArchived = workspace !== undefined
+        && (workspace.global.get() as { archivedSessionIds: string[] }).archivedSessionIds.includes(id)
+      const trashPath = trashSessionDir(id)
+      let archiveStarted = false
+      let artifactMoved = false
+      let failureCode = 'delete-failed'
+
+      try {
+        failureCode = 'archive-failed'
+        archiveStarted = true
+        await workspaceRegistry(ctx).archiveSession(id)
+        failureCode = 'delete-failed'
+
+        {
+          const currentWorkspace = ctx.storageDomain.get('workspace')
+          if (currentWorkspace !== undefined) {
+            const current = currentWorkspace.global.get() as { archivedSessionIds: string[] }
+            if (!current.archivedSessionIds.includes(id)) {
+              const next = { ...current, archivedSessionIds: [...current.archivedSessionIds, id] }
+              await currentWorkspace.global.set(next)
+              syncRegistryState(ctx, next)
+              ctx.logger.debug(`[dsh-session-manager] patched archived set for ${id} (stale registry cache)`)
+            }
+          }
+        }
+
+        if (!live && originalPath !== undefined && existsSync(originalPath)) {
+          await mkdir(trashRoot(), { recursive: true })
+          await rm(trashPath, { recursive: true, force: true })
+          await rename(originalPath, trashPath)
+          artifactMoved = true
+          ctx.logger.debug(`[dsh-session-manager] moved ${id} artifact to trash`)
+        }
+
+        const entries = getEntries()
+        const existingIndex = entries.findIndex((entry) => entry.sessionId === id)
+        let next: TrashEntry[]
+        let overflow: TrashEntry[] = []
+        if (existingIndex >= 0) {
+          next = entries.map((entry, index) => index === existingIndex ? { ...entry, deletedAt: Date.now() } : entry)
+        } else {
+          next = [...entries, { sessionId: id, cwd: meta?.cwd, originalPath, deletedAt: Date.now() }]
+          if (next.length > TRASH_LIMIT) {
+            overflow = next.slice(0, next.length - TRASH_LIMIT)
+            next = next.slice(next.length - TRASH_LIMIT)
+          }
+        }
+        await setEntries(next)
+        for (const entry of overflow) {
+          await rm(trashSessionDir(entry.sessionId), { recursive: true, force: true }).catch(() => {})
+        }
+
+        return { ok: true }
+      } catch (error) {
+        if (artifactMoved && originalPath !== undefined && existsSync(trashPath) && !existsSync(originalPath)) {
+          try {
+            await mkdir(dirname(originalPath), { recursive: true })
+            await rename(trashPath, originalPath)
+          } catch (rollbackError) {
+            ctx.logger.warn(`[dsh-session-manager] artifact rollback failed for ${id}:`, rollbackError)
+          }
+        }
+        if (archiveStarted && !wasArchived) {
+          try {
+            await unarchive(ctx, id)
+          } catch (rollbackError) {
+            ctx.logger.warn(`[dsh-session-manager] archive rollback failed for ${id}:`, rollbackError)
+          }
+        }
+        ctx.logger.warn(`[dsh-session-manager] ${failureCode} for ${id}:`, error)
+        return { ok: false, status: 500, error: failureCode }
+      }
+    }
+
     // POST /dsh-session-manager/delete — soft delete into the trash.
+    // Subagent sessions reachable from this session are trashed first (deepest
+    // first); a running parent or descendant refuses the batch before anything
+    // moves, so a delete never leaves an orphan log behind.
     ctx.webServer.register({
       kind: 'exact',
       path: `${ROUTE_PREFIX}/delete`,
@@ -440,99 +591,31 @@ function setup(ctx: Context): Promise<() => Promise<void>> {
 
         try {
           await withMutationLock(async () => {
-            const headers = (await ctx.sessionPersistence.list()).map(compatHeader)
-            const meta = headers.find((header) => header.id === id)
-            const agent = ctx.agents.get(id)
-            const live = agent !== undefined
-
-            if (agent?.status === 'running') {
+            // The parent is checked first: a running session must not lose its
+            // children before the parent itself refuses to move.
+            if (ctx.agents.get(id)?.status === 'running') {
               respond(res, 409, { ok: false, error: 'session-live' })
               return
             }
-
-            let originalPath: string | undefined
-            if (meta !== undefined) {
-              const location = locateSession(ctx, meta)
-              if (location === undefined) {
-                respond(res, 500, { ok: false, error: 'no-artifact-location' })
+            const descendants = await subagentDescendants(ctx, id)
+            if (!descendants.ok) {
+              respond(res, descendants.status, { ok: false, error: descendants.error })
+              return
+            }
+            const headers = (await ctx.sessionPersistence.list()).map(compatHeader)
+            for (const childId of descendants.ids) {
+              const child = await trashOne(childId, headers)
+              if (!child.ok) {
+                respond(res, child.status, { ok: false, error: child.error })
                 return
               }
-              originalPath = dirname(location.path)
             }
-
-            const workspace = ctx.storageDomain.get('workspace')
-            const wasArchived = workspace !== undefined
-              && (workspace.global.get() as { archivedSessionIds: string[] }).archivedSessionIds.includes(id)
-            const trashPath = trashSessionDir(id)
-            let archiveStarted = false
-            let artifactMoved = false
-            let failureCode = 'delete-failed'
-
-            try {
-              failureCode = 'archive-failed'
-              archiveStarted = true
-              await workspaceRegistry(ctx).archiveSession(id)
-              failureCode = 'delete-failed'
-
-              {
-                const currentWorkspace = ctx.storageDomain.get('workspace')
-                if (currentWorkspace !== undefined) {
-                  const current = currentWorkspace.global.get() as { archivedSessionIds: string[] }
-                  if (!current.archivedSessionIds.includes(id)) {
-                    const next = { ...current, archivedSessionIds: [...current.archivedSessionIds, id] }
-                    await currentWorkspace.global.set(next)
-                    syncRegistryState(ctx, next)
-                    ctx.logger.debug(`[dsh-session-manager] patched archived set for ${id} (stale registry cache)`)
-                  }
-                }
-              }
-
-              if (!live && originalPath !== undefined && existsSync(originalPath)) {
-                await mkdir(trashRoot(), { recursive: true })
-                await rm(trashPath, { recursive: true, force: true })
-                await rename(originalPath, trashPath)
-                artifactMoved = true
-                ctx.logger.debug(`[dsh-session-manager] moved ${id} artifact to trash`)
-              }
-
-              const entries = getEntries()
-              const existingIndex = entries.findIndex((entry) => entry.sessionId === id)
-              let next: TrashEntry[]
-              let overflow: TrashEntry[] = []
-              if (existingIndex >= 0) {
-                next = entries.map((entry, index) => index === existingIndex ? { ...entry, deletedAt: Date.now() } : entry)
-              } else {
-                next = [...entries, { sessionId: id, cwd: meta?.cwd, originalPath, deletedAt: Date.now() }]
-                if (next.length > TRASH_LIMIT) {
-                  overflow = next.slice(0, next.length - TRASH_LIMIT)
-                  next = next.slice(next.length - TRASH_LIMIT)
-                }
-              }
-              await setEntries(next)
-              for (const entry of overflow) {
-                await rm(trashSessionDir(entry.sessionId), { recursive: true, force: true }).catch(() => {})
-              }
-
-              respond(res, 200, { ok: true })
-            } catch (error) {
-              if (artifactMoved && originalPath !== undefined && existsSync(trashPath) && !existsSync(originalPath)) {
-                try {
-                  await mkdir(dirname(originalPath), { recursive: true })
-                  await rename(trashPath, originalPath)
-                } catch (rollbackError) {
-                  ctx.logger.warn(`[dsh-session-manager] artifact rollback failed for ${id}:`, rollbackError)
-                }
-              }
-              if (archiveStarted && !wasArchived) {
-                try {
-                  await unarchive(ctx, id)
-                } catch (rollbackError) {
-                  ctx.logger.warn(`[dsh-session-manager] archive rollback failed for ${id}:`, rollbackError)
-                }
-              }
-              ctx.logger.warn(`[dsh-session-manager] ${failureCode} for ${id}:`, error)
-              respond(res, 500, { ok: false, error: failureCode })
+            const outcome = await trashOne(id, headers)
+            if (!outcome.ok) {
+              respond(res, outcome.status, { ok: false, error: outcome.error })
+              return
             }
+            respond(res, 200, { ok: true })
           })
         } catch (error) {
           ctx.logger.warn('[dsh-session-manager] delete failed:', error)

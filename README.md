@@ -19,11 +19,12 @@
 - **新聊天中继续**：每个会话一键 fork 子会话（官方 `sessions.fork`）并打开
 - **文件夹**：在系统文件管理器中打开会话日志目录
 - **删除本对话**：对话顶部右侧红色按钮，一键删除当前对话（Session log 左侧）
+- **侧边栏删除**：官方侧边栏会话行的「⋯」菜单新增「删除会话」，确认后删除该会话，并**级联删除它派生的子代理会话**（由深到浅，先子后父）
 - **对话管理 / 回收站**：对话顶部入口，打开自绘右侧抽屉（图钉固定常驻、点击外部自动收起），行内「更多」悬浮菜单收纳统计 / 文件夹 / 新聊天中继续
 - **工作区管理**：会话按工作区分组展示，组内按最后使用时间排序（可切换最新/最旧）；拖拽工作区标题即可调整顺序（插入 / 交换 / 拖到末尾）；悬停标题出现**置于顶部 / 重命名 / 删除**按钮（删除按官方定义：仅移出列表，文件夹与会话记录保留，会话归入「未分组」）
 - **上下文压缩阈值**（通用设置）：设置对话上下文用到模型窗口（100 万 token）的多少比例时自动压缩（17%–90%），每次压缩保留最近 16% 原文；**对所有 Agent 预设的会话统一生效**（保存即时 + 持久化 + 重启自动应用）
-- 删除限制：仅禁止删除「正在思考」的会话；当前打开的会话（空闲）可删除
-- 子代理（subagent）会话支持删除（非运行中）：即使主会话已删除、子代理成为「孤儿」，也能在会话管理中直接清理
+- 删除限制：仅禁止删除「正在思考」的会话，以及其子代理会话仍在运行的会话；当前打开的会话（空闲）可删除
+- 子代理（subagent）会话支持删除（非运行中）：删除主会话时会级联删除其可达的子代理会话；即使主会话早已删除、子代理成为「孤儿」，也能在会话管理中直接清理
 - 中英文界面自适应（跟随页面语言）
 
 ## 安装
@@ -111,6 +112,16 @@ dsh plugin --profile web add /absolute/path/to/dsh-session-manager-0.2.2.tgz
 - **回收站**：打开抽屉并直接展开回收站
 - **删除本对话**（红色）：确认后删除当前对话（移入回收站）
 
+### 侧边栏会话菜单删除
+
+侧边栏会话行右侧的「⋯」菜单里（官方「归档」之后）新增 **删除会话**：
+
+1. 点击后弹出确认框（与其他删除入口一致）；
+2. 确认后先删除该会话派生的子代理会话（由深到浅），再删除会话本身，全部进入回收站；
+3. 会话行立即消失；若删除的是当前打开的会话，会在原工作区重新进入空白会话。
+
+该会话或其子代理会话正在生成回复时，删除会被拒绝并提示稍后重试。
+
 ### 未读 / 已读状态点
 
 会话行标题旁的圆点表示四种状态：**蓝色**=手动标记未读、**琥珀**=官方等待输入、**绿色**=官方完成提醒、**转圈**=运行中。点击琥珀 / 绿色点**就地标记已读**（不跳转，仅清除官方提醒）；点击蓝色点清除未读；点击空白位置标记未读；打开会话自动已读。官方侧边栏的会话行旁同步显示蓝色未读点（按标题文本匹配，重复标题会话会共享该点）。
@@ -119,8 +130,8 @@ dsh plugin --profile web add /absolute/path/to/dsh-session-manager-0.2.2.tgz
 
 | 层 | 实现 |
 |---|---|
-| Host | `src/index.ts` 注册 7 条路由：`POST /delete`（归档 + 非 live 会话文件移入回收站 + 记录条目）、`POST /restore`（文件移回 + 取消归档 + 删除条目）、`POST /purge`（清除回收站与原位置文件 + 删除条目）、`GET /trash`（回收站列表）、`POST /open-folder`（打开日志目录）、`POST /pause`（暂停运行中会话）、`GET|POST /compaction-threshold`（读写全局压缩阈值）。通过 `ctx.sessionPersistence` 定位会话、`ctx.workspaceRegistry` 归档/取消归档、`ctx.storageDomain` 持久化回收站条目、归档集合与阈值；`ctx.agents` 检测运行中的会话并拒绝删除 |
-| Client | `src/client/index.ts` 通过官方 `settings.section` 插槽注册独立分栏，用 `useSessions` / `useWorkspaces` 标准数据源列出会话（含归档/回收站分组），删除/恢复/彻底删除调用 host 路由；抽屉通过 `sessions.list`（ObservableSnapshot）订阅实时列表；彻底删除的会话 id 记录在浏览器 localStorage，避免 live 会话删除后刷新「复活」 |
+| Host | `src/index.ts` 注册 7 条路由：`POST /delete`（归档 + 非 live 会话文件移入回收站 + 记录条目；先按子代理目录由深到浅级联删除可达的子代理会话）、`POST /restore`（文件移回 + 取消归档 + 删除条目）、`POST /purge`（清除回收站与原位置文件 + 删除条目）、`GET /trash`（回收站列表）、`POST /open-folder`（打开日志目录）、`POST /pause`（暂停运行中会话）、`GET|POST /compaction-threshold`（读写全局压缩阈值）。通过 `ctx.sessionPersistence` 定位会话、`ctx.workspaceRegistry` 归档/取消归档、`ctx.storageDomain` 持久化回收站条目、归档集合与阈值；`ctx.agents` 检测运行中的会话并拒绝删除；`ctx.subagents.listDescendants` 枚举子代理会话 |
+| Client | `src/client/index.ts` 通过官方 `settings.section` 插槽注册独立分栏，用 `useSessions` / `useWorkspaces` 标准数据源列出会话（含归档/回收站分组），删除/恢复/彻底删除调用 host 路由；抽屉通过 `sessions.list`（ObservableSnapshot）订阅实时列表；彻底删除的会话 id 记录在浏览器 localStorage，避免 live 会话删除后刷新「复活」；并在官方 `sidebar.workspaces.session.menu.item` 插槽注册「删除会话」行 |
 
 - **未读机制**：手动未读集保存在浏览器 localStorage 的共享 key `dsh.session-unread.v1`（`{version:1, ids:[]}` 格式，与其他会话管理插件互通）；官方状态点（琥珀/绿色/转圈）由官方 `SessionSummary` 的 `pendingInteraction` / `completed` / `running` 字段驱动，点击就地已读通过清除官方提醒标记实现，无需打开会话；侧边栏的蓝色未读点由 MutationObserver 装饰官方树节点（官方行元素没有会话 id 属性，故按标题文本匹配）
 - **压缩阈值全局生效**：保存在存储域（`dsh_delete_session` 的 `thresholdRatio`）；如果默认 Agent 预设是用户预设，则同时写入 agent-presets 服务解析出的 `agent.cordis.yml`，系统预设文件保持只读。host 在每个 `agent/pre-step` 钩子里把阈值写入所有预设的压缩引擎配置，因此对所有 Agent 预设的会话统一生效，重启后依然有效
@@ -135,11 +146,12 @@ dsh plugin --profile web add /absolute/path/to/dsh-session-manager-0.2.2.tgz
 - **子代理会话可删除**（非运行中），包括主会话已删除的「孤儿子代理」——不会再有无法清理的残留会话
 - live 会话（当前进程内打开的会话）删除后，其内存状态由 DSH 在重启时彻底清理
 - 已彻底删除的会话 id 会保留在浏览器 localStorage（防止刷新后重新出现）与归档集合中（无害残留，不显示）
+- 级联只覆盖子代理目录可达的会话（`ctx.subagents.listDescendants`）；子代理目录读不到时退化为只删主会话，并在 dsh 日志里留一条 warning
 - 侧边栏未读点按标题文本匹配，存在重复标题的会话时两者会共享同一个点（会话管理抽屉内不受影响，按真实会话 id 精确标记）
 
 ## 兼容性
 
-当前版本适配 DSH `0.1.1-rc.1` 与 `0.2.0-rc.2`（依赖 `settings.section` / `settings.general.item` / `conversation.session.header.utilities` 插槽与 `ctx.sessionPersistence` / `ctx.workspaceRegistry` / `ctx.agents` / `ctx.storageDomain` / `ctx.agentPresets` 服务）。DSH 版本升级后如插槽或服务 API 变化，需要同步适配。
+当前版本适配 DSH `0.1.1-rc.1` 与 `0.2.0-rc.2`（依赖 `settings.section` / `settings.general.item` / `conversation.session.header.utilities` / `sidebar.workspaces.session.menu.item` 插槽与 `ctx.sessionPersistence` / `ctx.workspaceRegistry` / `ctx.agents` / `ctx.subagents` / `ctx.storageDomain` / `ctx.agentPresets` 服务）。DSH 版本升级后如插槽或服务 API 变化，需要同步适配。
 
 ## 开发
 
