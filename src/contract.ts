@@ -28,6 +28,8 @@ export interface UndoRequest {
   sessionId: string
   /** Target user message sequence; omitted selects the latest user message. */
   userSeq?: number
+  /** Assistant message to roll back *before* (its turn's user message becomes the target). */
+  messageId?: string
 }
 
 /** POST /dsh-session-manager/undo response body. */

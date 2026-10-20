@@ -478,6 +478,30 @@ const STYLE = `
 .dsh-session-menu-item--danger {
   color: var(--dsw-alias-state-danger-border, #ef4444);
 }
+/* Per-message undo action in a finalized assistant message's action row. */
+.dsh-session-undo-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 24px;
+  padding: 0 6px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--dsw-alias-label-secondary, #4b5563);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+}
+.dsh-session-undo-action:hover:not(:disabled) {
+  background: var(--dsw-alias-interactive-bg-hover, rgba(0, 0, 0, .06));
+  color: var(--dsw-alias-label-primary, #0f1115);
+}
+.dsh-session-undo-action:disabled {
+  opacity: .5;
+  cursor: default;
+}
 /* Per-row "More" popover menu (self-drawn). */
 .dsh-delete-session__more-wrap {
   position: relative;
@@ -951,6 +975,7 @@ function stringsOf() {
         delete: '删除',
         menuDelete: '删除会话',
         undoTurn: '回退上一轮',
+        undoMessageHint: '回退到这条回复之前(含本轮的工作区文件改动)',
         undoConfirm: '确定回退上一轮吗？本轮工具对工作区文件的修改会被撤销，对话截断到上一条用户消息之前；原会话会被归档，可在「会话管理」里恢复或删除。',
         undoFailed: '回退失败',
         undoRunning: '会话正在运行，请稍后再试',
@@ -1050,6 +1075,7 @@ function stringsOf() {
         delete: 'Delete',
         menuDelete: 'Delete session',
         undoTurn: 'Undo last turn',
+        undoMessageHint: 'Roll back to before this reply (includes the turn’s workspace changes)',
         undoConfirm: 'Undo the last turn? Files changed by its tool calls are restored, the conversation is cut at the previous user message, and the original session is archived (restore or delete it from Session Manager).',
         undoFailed: 'Undo failed',
         undoRunning: 'the session is running, try again later',
@@ -2376,6 +2402,50 @@ export function apply(ctx: ClientContext): void {
     order: 420,
     inject: () => ({ undoSession: undoSessionFromMenu }),
   }, SidebarUndoMenuItem))
+
+  // Per-message undo. DSH 0.2.x has no user-message action slot
+  // (`conversation.chat.user-actions` is unavailable), so the button sits in the
+  // finalized assistant reply's action row; the host maps that message back to
+  // the user message that started its turn.
+  const undoMessage = (sessionId: string, messageId: string): void => {
+    const strings = stringsOf()
+    if (!window.confirm(strings.undoConfirm)) return
+    void (async () => {
+      try {
+        const response = await fetch(UNDO_ROUTE, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ sessionId, messageId }),
+        })
+        const data = (await response.json().catch(() => ({}))) as UndoResponse
+        if (!response.ok || data.ok !== true) throw new Error(data.error ?? `HTTP ${response.status}`)
+        try {
+          await (sessions as unknown as { refresh?: () => Promise<unknown> }).refresh?.()
+        } catch {
+          // Best-effort; the next list refresh re-baselines anyway.
+        }
+        if (typeof data.sessionId === 'string' && data.sessionId !== '') {
+          ctx.get<{ openSession(sessionId: string): void }>('uiWorkspace')?.openSession(data.sessionId)
+        }
+        if (typeof data.warning === 'string' && data.warning !== '') window.alert(data.warning)
+      } catch (error) {
+        const code = error instanceof Error ? error.message : ''
+        const friendly = code === 'session-live'
+          ? strings.undoRunning
+          : code === 'no-user-message' || code === 'message-not-found'
+            ? strings.undoNoMessage
+            : ''
+        window.alert(strings.undoFailed + (friendly !== '' ? ` (${friendly})` : code !== '' ? ` (${code})` : ''))
+      }
+    })()
+  }
+
+  ctx.slots.inject('conversation.chat.assistant-actions', () => ctx.slots.register({
+    name: 'conversation.chat.assistant-actions',
+    id: 'dsh-delete-session-undo-message',
+    order: 20,
+    inject: () => ({ undoMessage }),
+  }, AssistantUndoAction))
 }
 
 interface ClientContext {
@@ -2505,6 +2575,30 @@ function UndoArrowIcon(): ReactElement {
     createElement('path', { d: 'M9 7L4 12l5 5' }),
     createElement('path', { d: 'M4 12h9a5 5 0 0 1 0 10h-2' }),
   )
+}
+
+/** Props of the per-message undo action: the owning message id plus the session. */
+interface AssistantUndoActionProps {
+  messageId: string
+  sessionId: string
+  /** Rolls the workspace and the conversation back to before this turn. */
+  undoMessage: (sessionId: string, messageId: string) => void
+}
+
+/**
+ * "回退到这条回复之前" action appended to a finalized assistant message's
+ * action row. DSH 0.2.x has no user-message action slot, so the turn's own
+ * reply carries the button.
+ */
+function AssistantUndoAction({ messageId, sessionId, undoMessage }: AssistantUndoActionProps): ReactElement {
+  const strings = useLocaleStrings()
+  return createElement('button', {
+    type: 'button',
+    className: 'dsh-session-undo-action',
+    title: strings.undoMessageHint,
+    'aria-label': strings.undoMessageHint,
+    onClick: () => undoMessage(sessionId, messageId),
+  }, createElement(UndoArrowIcon, null), createElement('span', null, strings.undoTurn))
 }
 
 // ── General-settings preference row: context compaction threshold ──────────

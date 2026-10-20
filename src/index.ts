@@ -266,6 +266,13 @@ function parseUserSeq(body: unknown): number | undefined {
   return typeof value === 'number' && Number.isInteger(value) && value >= 0 ? value : undefined
 }
 
+/** Optional `messageId` of an undo request (a durable assistant message id). */
+function parseMessageId(body: unknown): string | undefined {
+  const value = (body as { messageId?: unknown } | null)?.messageId
+  if (typeof value !== 'string' || value.length === 0 || value.length > 128) return undefined
+  return /^[A-Za-z0-9._:-]+$/.test(value) ? value : undefined
+}
+
 /** Last real user message in a session's events. */
 function lastUserSeq(events: readonly WorkspaceEvent[]): number | undefined {
   for (let index = events.length - 1; index >= 0; index--) {
@@ -275,6 +282,34 @@ function lastUserSeq(events: readonly WorkspaceEvent[]): number | undefined {
     if (data?.source?.kind === 'user') return event.seq
   }
   return undefined
+}
+
+/**
+ * The user message that started the turn of one finalized assistant message.
+ *
+ * @param events - the session's committed events.
+ * @param messageId - durable assistant message id from the Chat row.
+ * @returns the owning user message seq, or undefined when the message is unknown.
+ */
+function userSeqForMessage(events: readonly WorkspaceEvent[], messageId: string): number | undefined {
+  let cut: number | undefined
+  for (const event of events) {
+    if (event.type !== 'assistant/message') continue
+    const data = event.data as { message?: { id?: unknown } } | undefined
+    if (String(data?.message?.id) === messageId) {
+      cut = event.seq
+      break
+    }
+  }
+  if (cut === undefined) return undefined
+  let found: number | undefined
+  for (const event of events) {
+    if (event.seq >= cut) break
+    if (event.type !== 'user/message') continue
+    const data = event.data as { source?: { kind?: string } } | undefined
+    if (data?.source?.kind === 'user') found = event.seq
+  }
+  return found
 }
 
 /** Last `turn/end` before a sequence: the clean fork boundary for an undo. */
@@ -777,7 +812,11 @@ function setup(ctx: Context): Promise<() => Promise<void>> {
         if ((body as { userSeq?: unknown }).userSeq !== undefined && parseUserSeq(body) === undefined) {
           return respond(res, 400, { ok: false, error: 'invalid-user-seq' })
         }
+        if ((body as { messageId?: unknown }).messageId !== undefined && parseMessageId(body) === undefined) {
+          return respond(res, 400, { ok: false, error: 'invalid-message-id' })
+        }
         const requestedUserSeq = parseUserSeq(body)
+        const requestedMessageId = parseMessageId(body)
 
         const controller = sessionController()
         if (controller === undefined) return respond(res, 500, { ok: false, error: 'controller-unavailable' })
@@ -813,9 +852,11 @@ function setup(ctx: Context): Promise<() => Promise<void>> {
               type: event.type,
               data: event.data,
             }))
-            const target = requestedUserSeq ?? lastUserSeq(events)
+            const target = requestedUserSeq
+              ?? (requestedMessageId === undefined ? undefined : userSeqForMessage(events, requestedMessageId))
+              ?? lastUserSeq(events)
             if (target === undefined) {
-              respond(res, 400, { ok: false, error: 'no-user-message' })
+              respond(res, 400, { ok: false, error: requestedMessageId === undefined ? 'no-user-message' : 'message-not-found' })
               return
             }
             const boundary = turnEndBefore(events, target)
