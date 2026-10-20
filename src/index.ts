@@ -512,8 +512,17 @@ function setup(ctx: Context): Promise<() => Promise<void>> {
   return ctx.storageDomain.open(trashDomainSpec).then((trash) => {
     // The fiber can be disposed (dependency restart) while the domain opens.
     if ((ctx as unknown as { fiber?: { uid: unknown } }).fiber?.uid === null) {
-      void trash.close()
+      Promise.resolve(trash.close()).catch((error: unknown) => {
+        ctx.logger.warn('[dsh-session-manager] trash close failed:', error)
+      })
       return async () => {}
+    }
+    // webServer.register throws on a duplicate (kind, path): keep every route's
+    // disposer so a dependency re-provision (hot reload, plugin install) can
+    // withdraw the previous registration before the callback re-runs.
+    const routeDisposers: Array<() => void> = []
+    const registerRoute = (route: Parameters<typeof ctx.webServer.register>[0]): void => {
+      routeDisposers.push(ctx.webServer.register(route))
     }
     const getEntries = (): TrashEntry[] => (trash.global.get() as { entries: TrashEntry[] }).entries
     const setEntries = (entries: TrashEntry[]): Promise<void> => {
@@ -743,7 +752,12 @@ function setup(ctx: Context): Promise<() => Promise<void>> {
     // Subagent sessions reachable from this session are trashed first (deepest
     // first); a running parent or descendant refuses the batch before anything
     // moves, so a delete never leaves an orphan log behind.
-    ctx.webServer.register({
+    // The try/catch unwinds routes registered so far when a later registration
+    // fails (e.g. another plugin owns one of these paths) — a leaked partial
+    // registration would make every later re-provision collide with
+    // "duplicate exact route" forever. Body stays at outer indentation on purpose.
+    try {
+    registerRoute({
       kind: 'exact',
       path: `${ROUTE_PREFIX}/delete`,
       handler: async (req, res) => {
@@ -796,7 +810,7 @@ function setup(ctx: Context): Promise<() => Promise<void>> {
     // turn and restore the workspace files that turn (and later ones) changed.
     // DSH 0.2.x has no in-place surface rewind, so the cut is a fork: the target
     // session is archived and the client opens the new one.
-    ctx.webServer.register({
+    registerRoute({
       kind: 'exact',
       path: `${ROUTE_PREFIX}/undo`,
       handler: async (req, res) => {
@@ -915,7 +929,7 @@ function setup(ctx: Context): Promise<() => Promise<void>> {
     })
 
     // POST /dsh-session-manager/restore — move the artifact back and unarchive.
-    ctx.webServer.register({
+    registerRoute({
       kind: 'exact',
       path: `${ROUTE_PREFIX}/restore`,
       handler: async (req, res) => {
@@ -983,7 +997,7 @@ function setup(ctx: Context): Promise<() => Promise<void>> {
     })
 
     // POST /dsh-session-manager/purge — permanently delete the trash entry.
-    ctx.webServer.register({
+    registerRoute({
       kind: 'exact',
       path: `${ROUTE_PREFIX}/purge`,
       handler: async (req, res) => {
@@ -1023,7 +1037,7 @@ function setup(ctx: Context): Promise<() => Promise<void>> {
     })
 
     // POST /dsh-session-manager/pause — stop a running session's current turn.
-    ctx.webServer.register({
+    registerRoute({
       kind: 'exact',
       path: `${ROUTE_PREFIX}/pause`,
       handler: async (req, res) => {
@@ -1053,7 +1067,7 @@ function setup(ctx: Context): Promise<() => Promise<void>> {
 
     // POST /dsh-session-manager/stats — minimal event list for the client stats
     // fold (the official session.history RPC no longer exists in DSH 0.2.0).
-    ctx.webServer.register({
+    registerRoute({
       kind: 'exact',
       path: `${ROUTE_PREFIX}/stats`,
       handler: async (req, res) => {
@@ -1091,7 +1105,7 @@ function setup(ctx: Context): Promise<() => Promise<void>> {
     })
 
     // GET /dsh-session-manager/trash — list trash entries.
-    ctx.webServer.register({
+    registerRoute({
       kind: 'exact',
       path: `${ROUTE_PREFIX}/trash`,
       handler: async (_req, res) => {
@@ -1110,7 +1124,7 @@ function setup(ctx: Context): Promise<() => Promise<void>> {
     // System preset files are read-only, so they are never modified; the
     // threshold is still enforced on EVERY session's engine at each step
     // boundary and survives restarts through the storage domain.
-    ctx.webServer.register({
+    registerRoute({
       kind: 'exact',
       path: `${ROUTE_PREFIX}/compaction-threshold`,
       handler: async (req, res) => {
@@ -1167,7 +1181,7 @@ function setup(ctx: Context): Promise<() => Promise<void>> {
 
     // POST /dsh-session-manager/open-folder — reveal a session's log directory
     // in the system file manager.
-    ctx.webServer.register({
+    registerRoute({
       kind: 'exact',
       path: `${ROUTE_PREFIX}/open-folder`,
       handler: async (req, res) => {
@@ -1208,13 +1222,34 @@ function setup(ctx: Context): Promise<() => Promise<void>> {
       },
     })
 
-    return () => trash.close()
+    return async () => {
+      for (let i = routeDisposers.length - 1; i >= 0; i--) {
+        try { routeDisposers[i]() } catch (error) {
+          ctx.logger.warn('[dsh-session-manager] route dispose failed:', error)
+        }
+      }
+      await trash.close()
+    }
+    } catch (error) {
+      for (let i = routeDisposers.length - 1; i >= 0; i--) {
+        try { routeDisposers[i]() } catch {}
+      }
+      Promise.resolve(trash.close()).catch((closeError: unknown) => {
+        ctx.logger.warn('[dsh-session-manager] trash close after failed setup:', closeError)
+      })
+      throw error
+    }
   })
 }
 
 export function apply(ctx: Context): void {
   ctx.inject(SCOPED_SERVICES, (scoped: Context) => {
     const ready = setup(scoped)
-    scoped.effect(() => () => ready.then((dispose) => dispose()).catch(() => {}), 'dsh-session-manager')
+    scoped.effect(() => () => ready.then((dispose) => dispose()).catch((error) => {
+      // setup failed midway (it unwinds its own routes); log instead of
+      // swallowing, or a later re-provision would collide with leaked state.
+      const logger = (scoped as unknown as { logger?: { warn?: (message: string, error: unknown) => void } }).logger
+      logger?.warn?.('[dsh-session-manager] scoped setup failed:', error)
+    }), 'dsh-session-manager')
   })
 }
