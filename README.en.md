@@ -132,7 +132,7 @@ Available in the sidebar "⋯" menu (after Delete session) and in the drawer row
 3. The original session is archived and can be restored or deleted from Session Manager;
 4. The pre-undo file state is kept as a redo snapshot for a future "redo".
 
-Scope of the file rollback: files inside the git repository that contains the session's working directory, not excluded by `.gitignore`, with untracked files up to 2 MiB. Database writes, HTTP calls and side effects of external processes cannot be reverted.
+Scope of the file rollback: files inside the git repository that contains the session's working directory, not excluded by `.gitignore`, with untracked files up to 2 MiB. Database writes, HTTP calls and side effects of external processes cannot be reverted. When the working directory is not a git repository, the plugin **runs `git init` automatically** (creates `.git` only, touches no files) before snapshotting; drive roots are skipped.
 
 ### Unread / read status dots
 
@@ -161,7 +161,7 @@ The dot next to a session's title shows one of four states: **blue** = manually 
 - Sidebar unread dots are matched by title text: sessions with duplicate titles share the same dot (the drawer is unaffected — it marks by real session id)
 
 - **Undo last turn** restores only the files the turn's tools changed plus the conversation: the new session is not the original one (the original is archived), and `.gitignore`d files, untracked files above 2 MiB, paths outside the working directory, and database/network/external-process side effects stay untouched
-- File snapshots need the `git` command and a git repository; when either is missing (or the snapshot store would sit inside the repository) the undo degrades to a conversation-only rollback and says so
+- File snapshots need the `git` command; a working directory that is not a git repository is auto-initialized with `git init` (`.git` only), drive roots are never snapshotted, and a snapshot store inside the repository skips the file rollback — each case is stated in the undo result
 
 ## Compatibility
 
