@@ -36,6 +36,8 @@ import type {} from '@deepseek-ai/dsh-session-persistence'
 import type {} from '@deepseek-ai/dsh-workspace'
 import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-storage-domain'
+// Type-only: brings the ctx.tools waterfall payloads into this program.
+import type {} from '@deepseek-ai/dsh-tools'
 // Type-only: brings the ctx.agentPresets service merge into this program.
 import type {} from '@deepseek-ai/dsh-agent-preset-registry'
 // Type-only: brings the ctx.loader merge into this program.
@@ -48,6 +50,7 @@ import { existsSync } from 'node:fs'
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { spawn } from 'node:child_process'
 import { dirname, join } from 'node:path'
+import { WorkspaceSnapshots, type WorkspaceEvent } from './workspace.ts'
 
 export const name = 'dsh-session-manager'
 /**
@@ -65,6 +68,28 @@ const SCOPED_SERVICES = [
 ]
 
 type StoredHeader = { id: SessionId; cwd?: string }
+
+/** The live session-store surface undo needs; the service is optional. */
+interface LiveSession {
+  readonly header: { cwd?: string }
+  readonly seq: number
+  snapshotEvents(fromSeq?: number): readonly { seq: number; type: string; data: unknown }[]
+}
+
+interface LiveSessions {
+  get(id: string): LiveSession | undefined
+  flush(session: LiveSession): Promise<boolean>
+}
+
+/** The session-controller operations undo needs; the service is optional. */
+interface SessionControllerFace {
+  inspect(
+    sessionId: string,
+    signal?: AbortSignal,
+  ): Promise<{ meta: { cwd?: string }; events: readonly { seq: number; type: string; data: unknown }[] }>
+  fork(request: { sessionId: string; atSeq?: number }): Promise<{ sessionId: string }>
+  create(request: { cwd?: string }): Promise<{ sessionId: string }>
+}
 
 /**
  * Resolved lazily: in DSH 0.2.0 the registry activates late, and injecting it
@@ -232,6 +257,45 @@ function parseSessionId(body: unknown): SessionId | undefined {
   const sessionId = (body as { sessionId?: unknown } | null)?.sessionId
   if (typeof sessionId !== 'string' || !SESSION_ID_RE.test(sessionId)) return undefined
   return sessionId as SessionId
+}
+
+/** Optional `userSeq` of an undo request. */
+function parseUserSeq(body: unknown): number | undefined {
+  const value = (body as { userSeq?: unknown } | null)?.userSeq
+  if (value === undefined) return undefined
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0 ? value : undefined
+}
+
+/** Last real user message in a session's events. */
+function lastUserSeq(events: readonly WorkspaceEvent[]): number | undefined {
+  for (let index = events.length - 1; index >= 0; index--) {
+    const event = events[index]
+    if (event === undefined || event.type !== 'user/message') continue
+    const data = event.data as { source?: { kind?: string } } | undefined
+    if (data?.source?.kind === 'user') return event.seq
+  }
+  return undefined
+}
+
+/** Last `turn/end` before a sequence: the clean fork boundary for an undo. */
+function turnEndBefore(events: readonly WorkspaceEvent[], target: number): number | undefined {
+  let boundary: number | undefined
+  for (const event of events) {
+    if (event.seq >= target) break
+    if (event.type === 'turn/end') boundary = event.seq
+  }
+  return boundary
+}
+
+/** User message sequences from one target through the end (the turns an undo unwinds). */
+function userSeqsFrom(events: readonly WorkspaceEvent[], target: number): number[] {
+  const seqs: number[] = []
+  for (const event of events) {
+    if (event.seq < target || event.type !== 'user/message') continue
+    const data = event.data as { source?: { kind?: string } } | undefined
+    if (data?.source?.kind === 'user') seqs.push(event.seq)
+  }
+  return seqs
 }
 
 /**
@@ -471,6 +535,88 @@ function setup(ctx: Context): Promise<() => Promise<void>> {
       }, { prepend: true })
     }
 
+    // Workspace snapshots for "undo last turn": one hidden git repository per
+    // session, one tree before and after every root tool call. Snapshot work is
+    // best-effort and never fails the tool itself.
+    const snapshotStore = dshHomePath('dsh-session-manager-snapshots')
+    const trackers = new Map<string, WorkspaceSnapshots>()
+    const trackerFor = (sessionId: string, cwd: string | undefined): WorkspaceSnapshots => {
+      const existing = trackers.get(sessionId)
+      if (existing !== undefined) return existing
+      const tracker = new WorkspaceSnapshots({ sessionId, cwd, storeRoot: snapshotStore, logger: ctx.logger })
+      trackers.set(sessionId, tracker)
+      return tracker
+    }
+    /**
+     * Optional `sessions` / `sessionController` lookups.
+     *
+     * Both stay OUT of `SCOPED_SERVICES`: this plugin must keep mounting in a
+     * composition without them, and undo simply reports itself unavailable.
+     */
+    const liveSessions = (): LiveSessions | undefined => {
+      try {
+        return ctx.get('sessions') as LiveSessions | undefined
+      } catch {
+        return undefined
+      }
+    }
+    const sessionController = (): SessionControllerFace | undefined => {
+      try {
+        return ctx.get('sessionController') as SessionControllerFace | undefined
+      } catch {
+        return undefined
+      }
+    }
+    /** The tail of one live session's events: a whole turn fits in this window. */
+    const recentEvents = (session: LiveSession): readonly WorkspaceEvent[] =>
+      session
+        .snapshotEvents(Math.max(0, Number(session.seq) - 500))
+        .map((event) => ({ seq: event.seq, type: event.type, data: event.data }))
+
+    if (liveSessions() !== undefined) {
+      ctx.on('tools/execute', async (exec, next) => {
+        const agent = exec.agent
+        if (agent === undefined || exec.parent !== undefined) return next()
+        const live = liveSessions()?.get(String(agent.id))
+        if (live === undefined) return next()
+        return trackerFor(String(agent.id), live.header.cwd).around(exec, next, () => recentEvents(live))
+      })
+    }
+
+    /**
+     * Archive one session and make sure the client archive set carries its id.
+     *
+     * @param id - session to archive.
+     * @returns whether it was already archived, or the failure code.
+     */
+    const archiveOne = async (id: SessionId): Promise<{ ok: true; wasArchived: boolean } | { ok: false; error: string }> => {
+      const workspace = ctx.storageDomain.get('workspace')
+      const wasArchived = workspace !== undefined
+        && (workspace.global.get() as { archivedSessionIds: string[] }).archivedSessionIds.includes(id)
+      try {
+        await workspaceRegistry(ctx).archiveSession(id)
+      } catch (error) {
+        ctx.logger.warn(`[dsh-session-manager] archive failed for ${id}:`, error)
+        return { ok: false, error: 'archive-failed' }
+      }
+      try {
+        const currentWorkspace = ctx.storageDomain.get('workspace')
+        if (currentWorkspace !== undefined) {
+          const current = currentWorkspace.global.get() as { archivedSessionIds: string[] }
+          if (!current.archivedSessionIds.includes(id)) {
+            const next = { ...current, archivedSessionIds: [...current.archivedSessionIds, id] }
+            await currentWorkspace.global.set(next)
+            syncRegistryState(ctx, next)
+            ctx.logger.debug(`[dsh-session-manager] patched archived set for ${id} (stale registry cache)`)
+          }
+        }
+      } catch (error) {
+        ctx.logger.warn(`[dsh-session-manager] archived-set patch failed for ${id}:`, error)
+        return { ok: false, error: 'archive-failed' }
+      }
+      return { ok: true, wasArchived }
+    }
+
     /**
      * Archive one session and move its artifact into the trash.
      *
@@ -496,9 +642,7 @@ function setup(ctx: Context): Promise<() => Promise<void>> {
         originalPath = dirname(location.path)
       }
 
-      const workspace = ctx.storageDomain.get('workspace')
-      const wasArchived = workspace !== undefined
-        && (workspace.global.get() as { archivedSessionIds: string[] }).archivedSessionIds.includes(id)
+      let wasArchived = false
       const trashPath = trashSessionDir(id)
       let archiveStarted = false
       let artifactMoved = false
@@ -507,21 +651,10 @@ function setup(ctx: Context): Promise<() => Promise<void>> {
       try {
         failureCode = 'archive-failed'
         archiveStarted = true
-        await workspaceRegistry(ctx).archiveSession(id)
+        const archived = await archiveOne(id)
+        wasArchived = archived.ok ? archived.wasArchived : false
+        if (!archived.ok) return { ok: false, status: 500, error: archived.error }
         failureCode = 'delete-failed'
-
-        {
-          const currentWorkspace = ctx.storageDomain.get('workspace')
-          if (currentWorkspace !== undefined) {
-            const current = currentWorkspace.global.get() as { archivedSessionIds: string[] }
-            if (!current.archivedSessionIds.includes(id)) {
-              const next = { ...current, archivedSessionIds: [...current.archivedSessionIds, id] }
-              await currentWorkspace.global.set(next)
-              syncRegistryState(ctx, next)
-              ctx.logger.debug(`[dsh-session-manager] patched archived set for ${id} (stale registry cache)`)
-            }
-          }
-        }
 
         if (!live && originalPath !== undefined && existsSync(originalPath)) {
           await mkdir(trashRoot(), { recursive: true })
@@ -620,6 +753,122 @@ function setup(ctx: Context): Promise<() => Promise<void>> {
         } catch (error) {
           ctx.logger.warn('[dsh-session-manager] delete failed:', error)
           respond(res, 500, { ok: false, error: 'delete-failed' })
+        }
+      },
+    })
+
+    // POST /dsh-session-manager/undo — cut the conversation at the target user
+    // turn and restore the workspace files that turn (and later ones) changed.
+    // DSH 0.2.x has no in-place surface rewind, so the cut is a fork: the target
+    // session is archived and the client opens the new one.
+    ctx.webServer.register({
+      kind: 'exact',
+      path: `${ROUTE_PREFIX}/undo`,
+      handler: async (req, res) => {
+        if (req.method !== 'POST') return respond(res, 405, { ok: false, error: 'method-not-allowed' })
+        let body: unknown
+        try {
+          body = await readJsonBody(req)
+        } catch {
+          return respond(res, 400, { ok: false, error: 'bad-request' })
+        }
+        const id = parseSessionId(body)
+        if (id === undefined) return respond(res, 400, { ok: false, error: 'invalid-session-id' })
+        if ((body as { userSeq?: unknown }).userSeq !== undefined && parseUserSeq(body) === undefined) {
+          return respond(res, 400, { ok: false, error: 'invalid-user-seq' })
+        }
+        const requestedUserSeq = parseUserSeq(body)
+
+        const controller = sessionController()
+        if (controller === undefined) return respond(res, 500, { ok: false, error: 'controller-unavailable' })
+
+        try {
+          await withMutationLock(async () => {
+            if (ctx.agents.get(id)?.status === 'running') {
+              respond(res, 409, { ok: false, error: 'session-live' })
+              return
+            }
+            const live = liveSessions()?.get(String(id))
+            if (live !== undefined) {
+              await liveSessions()?.flush(live).catch((error: unknown) => {
+                ctx.logger.warn(`[dsh-session-manager] flush before undo failed for ${id}:`, error)
+              })
+            }
+
+            let inspection: Awaited<ReturnType<SessionControllerFace['inspect']>>
+            const abort = new AbortController()
+            const timer = setTimeout(() => abort.abort(), 15_000)
+            try {
+              inspection = await controller.inspect(String(id), abort.signal)
+            } catch (error) {
+              ctx.logger.warn(`[dsh-session-manager] inspect before undo failed for ${id}:`, error)
+              respond(res, 500, { ok: false, error: 'inspect-failed' })
+              return
+            } finally {
+              clearTimeout(timer)
+            }
+
+            const events: WorkspaceEvent[] = inspection.events.map((event) => ({
+              seq: event.seq,
+              type: event.type,
+              data: event.data,
+            }))
+            const target = requestedUserSeq ?? lastUserSeq(events)
+            if (target === undefined) {
+              respond(res, 400, { ok: false, error: 'no-user-message' })
+              return
+            }
+            const boundary = turnEndBefore(events, target)
+            const opId = `undo:${id}:${target}:${Date.now()}`
+            const tracker = trackerFor(String(id), inspection.meta.cwd)
+
+            let restored: { files: number; warning?: string }
+            try {
+              restored = await tracker.restore(userSeqsFrom(events, target), opId)
+            } catch (error) {
+              ctx.logger.warn(`[dsh-session-manager] workspace rollback failed for ${id}:`, error)
+              respond(res, 500, { ok: false, error: 'workspace-rollback-failed' })
+              return
+            }
+
+            let forked = true
+            let nextSessionId: string
+            try {
+              nextSessionId = boundary === undefined
+                ? String((await controller.create({ cwd: inspection.meta.cwd })).sessionId)
+                : String((await controller.fork({ sessionId: String(id), atSeq: boundary })).sessionId)
+              if (boundary === undefined) forked = false
+            } catch (error) {
+              ctx.logger.warn(`[dsh-session-manager] fork for undo failed for ${id}:`, error)
+              await tracker.rollback(opId).catch((rollbackError: unknown) => {
+                ctx.logger.warn(`[dsh-session-manager] undo compensation failed for ${id}:`, rollbackError)
+              })
+              respond(res, 500, { ok: false, error: 'fork-failed' })
+              return
+            }
+
+            const archived = await archiveOne(id)
+            if (!archived.ok) {
+              await tracker.rollback(opId).catch((rollbackError: unknown) => {
+                ctx.logger.warn(`[dsh-session-manager] undo compensation failed for ${id}:`, rollbackError)
+              })
+              respond(res, 500, { ok: false, error: archived.error })
+              return
+            }
+            await tracker.commit(opId).catch((error: unknown) => {
+              ctx.logger.warn(`[dsh-session-manager] redo bookkeeping failed for ${id}:`, error)
+            })
+            respond(res, 200, {
+              ok: true,
+              sessionId: nextSessionId,
+              files: restored.files,
+              forked,
+              ...(restored.warning === undefined ? {} : { warning: restored.warning }),
+            })
+          })
+        } catch (error) {
+          ctx.logger.warn('[dsh-session-manager] undo failed:', error)
+          respond(res, 500, { ok: false, error: 'undo-failed' })
         }
       },
     })

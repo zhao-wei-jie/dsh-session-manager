@@ -20,6 +20,30 @@ export const PAUSE_ROUTE = '/dsh-session-manager/pause'
 export const STATS_ROUTE = '/dsh-session-manager/stats'
 /** Write the context compaction threshold into the official compaction plugin config. */
 export const COMPACTION_THRESHOLD_ROUTE = '/dsh-session-manager/compaction-threshold'
+/** Roll the conversation and the workspace files back to the turn before one user message. */
+export const UNDO_ROUTE = '/dsh-session-manager/undo'
+
+/** POST /dsh-session-manager/undo request body. */
+export interface UndoRequest {
+  sessionId: string
+  /** Target user message sequence; omitted selects the latest user message. */
+  userSeq?: number
+}
+
+/** POST /dsh-session-manager/undo response body. */
+export interface UndoResponse {
+  ok: boolean
+  /** Machine-readable failure reason. */
+  error?: string
+  /** Session to open afterwards: the fork, or a fresh session when the first turn was undone. */
+  sessionId?: string
+  /** Workspace files restored to their pre-turn content. */
+  files?: number
+  /** True when the conversation was cut with a fork; false when a blank session replaced it. */
+  forked?: boolean
+  /** Non-fatal note (workspace snapshots unavailable, ignored files, …). */
+  warning?: string
+}
 
 /** POST /dsh-session-manager/delete request body. */
 export interface DeleteSessionRequest {

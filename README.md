@@ -20,6 +20,7 @@
 - **文件夹**：在系统文件管理器中打开会话日志目录
 - **删除本对话**：对话顶部右侧红色按钮，一键删除当前对话（Session log 左侧）
 - **侧边栏删除**：官方侧边栏会话行的「⋯」菜单新增「删除会话」，确认后删除该会话，并**级联删除它派生的子代理会话**（由深到浅，先子后父）
+- **回退上一轮**：同一菜单与抽屉行内「更多」里可一键撤销上一轮 —— 本轮工具改过的文件恢复原状，对话截断到上一条用户消息之前（用官方 fork 实现，原会话进归档）
 - **对话管理 / 回收站**：对话顶部入口，打开自绘右侧抽屉（图钉固定常驻、点击外部自动收起），行内「更多」悬浮菜单收纳统计 / 文件夹 / 新聊天中继续
 - **工作区管理**：会话按工作区分组展示，组内按最后使用时间排序（可切换最新/最旧）；拖拽工作区标题即可调整顺序（插入 / 交换 / 拖到末尾）；悬停标题出现**置于顶部 / 重命名 / 删除**按钮（删除按官方定义：仅移出列表，文件夹与会话记录保留，会话归入「未分组」）
 - **上下文压缩阈值**（通用设置）：设置对话上下文用到模型窗口（100 万 token）的多少比例时自动压缩（17%–90%），每次压缩保留最近 16% 原文；**对所有 Agent 预设的会话统一生效**（保存即时 + 持久化 + 重启自动应用）
@@ -122,6 +123,17 @@ dsh plugin --profile web add /absolute/path/to/dsh-session-manager-0.2.2.tgz
 
 该会话或其子代理会话正在生成回复时，删除会被拒绝并提示稍后重试。
 
+### 回退上一轮（撤销对话与文件改动）
+
+侧边栏「⋯」菜单（「删除会话」之后）与「对话管理」抽屉的行内「更多」菜单里都有 **回退上一轮**：
+
+1. 确认后，先把本轮工具动过的文件恢复到本轮开始前的内容（隐藏 git 快照，见下）；
+2. 再把对话截断到上一条用户消息之前 —— DSH 0.2.x 没有原地 rewind，这里用官方 `fork` 实现，因此**产生一个新会话**并在同工作区打开；
+3. 原会话自动归档，可在「会话管理」里恢复或删除；
+4. 恢复前的文件状态会存成 redo 快照，供后续「重做」使用（本期未开放入口）。
+
+文件回滚范围：会话工作目录所在的 git 仓库内、未被 `.gitignore` 排除、且未跟踪文件不超过 2 MiB 的部分。数据库写入、HTTP 调用、外部进程的副作用无法撤回。
+
 ### 未读 / 已读状态点
 
 会话行标题旁的圆点表示四种状态：**蓝色**=手动标记未读、**琥珀**=官方等待输入、**绿色**=官方完成提醒、**转圈**=运行中。点击琥珀 / 绿色点**就地标记已读**（不跳转，仅清除官方提醒）；点击蓝色点清除未读；点击空白位置标记未读；打开会话自动已读。官方侧边栏的会话行旁同步显示蓝色未读点（按标题文本匹配，重复标题会话会共享该点）。
@@ -130,8 +142,8 @@ dsh plugin --profile web add /absolute/path/to/dsh-session-manager-0.2.2.tgz
 
 | 层 | 实现 |
 |---|---|
-| Host | `src/index.ts` 注册 7 条路由：`POST /delete`（归档 + 非 live 会话文件移入回收站 + 记录条目；先按子代理目录由深到浅级联删除可达的子代理会话）、`POST /restore`（文件移回 + 取消归档 + 删除条目）、`POST /purge`（清除回收站与原位置文件 + 删除条目）、`GET /trash`（回收站列表）、`POST /open-folder`（打开日志目录）、`POST /pause`（暂停运行中会话）、`GET|POST /compaction-threshold`（读写全局压缩阈值）。通过 `ctx.sessionPersistence` 定位会话、`ctx.workspaceRegistry` 归档/取消归档、`ctx.storageDomain` 持久化回收站条目、归档集合与阈值；`ctx.agents` 检测运行中的会话并拒绝删除；`ctx.subagents.listDescendants` 枚举子代理会话 |
-| Client | `src/client/index.ts` 通过官方 `settings.section` 插槽注册独立分栏，用 `useSessions` / `useWorkspaces` 标准数据源列出会话（含归档/回收站分组），删除/恢复/彻底删除调用 host 路由；抽屉通过 `sessions.list`（ObservableSnapshot）订阅实时列表；彻底删除的会话 id 记录在浏览器 localStorage，避免 live 会话删除后刷新「复活」；并在官方 `sidebar.workspaces.session.menu.item` 插槽注册「删除会话」行 |
+| Host | `src/index.ts` 注册 8 条路由：`POST /delete`（归档 + 非 live 会话文件移入回收站 + 记录条目；先按子代理目录由深到浅级联删除可达的子代理会话）、`POST /undo`（恢复本轮文件 → `fork` 截断对话 → 归档原会话）、`POST /restore`（文件移回 + 取消归档 + 删除条目）、`POST /purge`（清除回收站与原位置文件 + 删除条目）、`GET /trash`（回收站列表）、`POST /open-folder`（打开日志目录）、`POST /pause`（暂停运行中会话）、`GET|POST /compaction-threshold`（读写全局压缩阈值）。通过 `ctx.sessionPersistence` 定位会话、`ctx.workspaceRegistry` 归档/取消归档、`ctx.storageDomain` 持久化回收站条目、归档集合与阈值；`ctx.agents` 检测运行中的会话并拒绝删除；`ctx.subagents.listDescendants` 枚举子代理会话；`ctx.sessionController.inspect/fork/create` 与 `ctx.sessions.flush` 支撑回退；`src/workspace.ts` 用隐藏 git 快照记录每个工具调用前后的工作区 |
+| Client | `src/client/index.ts` 通过官方 `settings.section` 插槽注册独立分栏，用 `useSessions` / `useWorkspaces` 标准数据源列出会话（含归档/回收站分组），删除/恢复/彻底删除调用 host 路由；抽屉通过 `sessions.list`（ObservableSnapshot）订阅实时列表；彻底删除的会话 id 记录在浏览器 localStorage，避免 live 会话删除后刷新「复活」；并在官方 `sidebar.workspaces.session.menu.item` 插槽注册「删除会话」与「回退上一轮」行 |
 
 - **未读机制**：手动未读集保存在浏览器 localStorage 的共享 key `dsh.session-unread.v1`（`{version:1, ids:[]}` 格式，与其他会话管理插件互通）；官方状态点（琥珀/绿色/转圈）由官方 `SessionSummary` 的 `pendingInteraction` / `completed` / `running` 字段驱动，点击就地已读通过清除官方提醒标记实现，无需打开会话；侧边栏的蓝色未读点由 MutationObserver 装饰官方树节点（官方行元素没有会话 id 属性，故按标题文本匹配）
 - **压缩阈值全局生效**：保存在存储域（`dsh_delete_session` 的 `thresholdRatio`）；如果默认 Agent 预设是用户预设，则同时写入 agent-presets 服务解析出的 `agent.cordis.yml`，系统预设文件保持只读。host 在每个 `agent/pre-step` 钩子里把阈值写入所有预设的压缩引擎配置，因此对所有 Agent 预设的会话统一生效，重启后依然有效
@@ -143,6 +155,8 @@ dsh plugin --profile web add /absolute/path/to/dsh-session-manager-0.2.2.tgz
 ## 限制
 
 - **不能删除正在运行的会话**（按钮禁用并拒绝删除），多标签页场景请先在别处确认该会话已停止
+- **回退上一轮**只撤销「本轮工具改过的文件」与「对话内容」：新会话不是原会话（原会话进归档）；`.gitignore` 排除的文件、超过 2 MiB 的未跟踪文件、工作目录之外的路径、数据库/网络/外部进程的副作用都不在回滚范围内
+- 文件快照需要 `git` 命令与一个 git 仓库；缺失或快照目录位于仓库内时自动降级为「只回退对话」，并在提示里说明
 - **子代理会话可删除**（非运行中），包括主会话已删除的「孤儿子代理」——不会再有无法清理的残留会话
 - live 会话（当前进程内打开的会话）删除后，其内存状态由 DSH 在重启时彻底清理
 - 已彻底删除的会话 id 会保留在浏览器 localStorage（防止刷新后重新出现）与归档集合中（无害残留，不显示）
@@ -151,7 +165,7 @@ dsh plugin --profile web add /absolute/path/to/dsh-session-manager-0.2.2.tgz
 
 ## 兼容性
 
-当前版本适配 DSH `0.1.1-rc.1` 与 `0.2.0-rc.2`（依赖 `settings.section` / `settings.general.item` / `conversation.session.header.utilities` / `sidebar.workspaces.session.menu.item` 插槽与 `ctx.sessionPersistence` / `ctx.workspaceRegistry` / `ctx.agents` / `ctx.subagents` / `ctx.storageDomain` / `ctx.agentPresets` 服务）。DSH 版本升级后如插槽或服务 API 变化，需要同步适配。
+当前版本适配 DSH `0.1.1-rc.1` 与 `0.2.0-rc.2`（依赖 `settings.section` / `settings.general.item` / `conversation.session.header.utilities` / `sidebar.workspaces.session.menu.item` 插槽与 `ctx.sessionPersistence` / `ctx.workspaceRegistry` / `ctx.agents` / `ctx.subagents` / `ctx.sessions` / `ctx.sessionController` / `ctx.storageDomain` / `ctx.agentPresets` 服务，以及 `tools/execute` 事件）。DSH 版本升级后如插槽、事件或服务 API 变化，需要同步适配。
 
 ## 开发
 

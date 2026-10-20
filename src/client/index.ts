@@ -41,9 +41,11 @@ import {
   RESTORE_ROUTE,
   STATS_ROUTE,
   TRASH_ROUTE,
+  UNDO_ROUTE,
   type ActionResultResponse,
   type TrashEntry,
   type TrashListResponse,
+  type UndoResponse,
 } from '../contract.ts'
 
 /** `IconTrashOutline16` was renamed `IconTrashOutlineRegular` in DSH 0.2.0. */
@@ -948,6 +950,11 @@ function stringsOf() {
         current: '当前会话',
         delete: '删除',
         menuDelete: '删除会话',
+        undoTurn: '回退上一轮',
+        undoConfirm: '确定回退上一轮吗？本轮工具对工作区文件的修改会被撤销，对话截断到上一条用户消息之前；原会话会被归档，可在「会话管理」里恢复或删除。',
+        undoFailed: '回退失败',
+        undoRunning: '会话正在运行，请稍后再试',
+        undoNoMessage: '没有可回退的用户消息',
         deleting: '删除中…',
         confirm: '确定删除会话「{title}」吗？它会移入回收站，可在「回收站」中恢复或彻底删除。',
         deleted: '已删除会话「{title}」',
@@ -1042,6 +1049,11 @@ function stringsOf() {
         current: 'current session',
         delete: 'Delete',
         menuDelete: 'Delete session',
+        undoTurn: 'Undo last turn',
+        undoConfirm: 'Undo the last turn? Files changed by its tool calls are restored, the conversation is cut at the previous user message, and the original session is archived (restore or delete it from Session Manager).',
+        undoFailed: 'Undo failed',
+        undoRunning: 'the session is running, try again later',
+        undoNoMessage: 'there is no user message to undo',
         deleting: 'Deleting…',
         confirm: 'Delete session "{title}"? It moves to the trash, where you can restore or permanently delete it.',
         deleted: 'Deleted session "{title}"',
@@ -2326,6 +2338,44 @@ export function apply(ctx: ClientContext): void {
     order: 410,
     inject: () => ({ deleteSession: deleteSessionFromMenu }),
   }, SidebarDeleteMenuItem))
+
+  // Sidebar session menu ("⋯"): undo the last turn (files + conversation).
+  const undoSessionFromMenu = (sessionId: string, title: string): void => {
+    const strings = stringsOf()
+    if (!window.confirm(strings.undoConfirm)) return
+    saveTitle(sessionId, title)
+    void (async () => {
+      try {
+        const response = await fetch(UNDO_ROUTE, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ sessionId }),
+        })
+        const data = (await response.json().catch(() => ({}))) as UndoResponse
+        if (!response.ok || data.ok !== true) throw new Error(data.error ?? `HTTP ${response.status}`)
+        try {
+          await (sessions as unknown as { refresh?: () => Promise<unknown> }).refresh?.()
+        } catch {
+          // Best-effort; the next list refresh re-baselines anyway.
+        }
+        if (typeof data.sessionId === 'string' && data.sessionId !== '') {
+          ctx.get<{ openSession(sessionId: string): void }>('uiWorkspace')?.openSession(data.sessionId)
+        }
+        if (typeof data.warning === 'string' && data.warning !== '') window.alert(data.warning)
+      } catch (error) {
+        const code = error instanceof Error ? error.message : ''
+        const friendly = code === 'session-live' ? strings.undoRunning : code === 'no-user-message' ? strings.undoNoMessage : ''
+        window.alert(strings.undoFailed + (friendly !== '' ? ` (${friendly})` : code !== '' ? ` (${code})` : ''))
+      }
+    })()
+  }
+
+  ctx.slots.inject('sidebar.workspaces.session.menu.item', () => ctx.slots.register({
+    name: 'sidebar.workspaces.session.menu.item',
+    id: 'dsh-delete-session-undo',
+    order: 420,
+    inject: () => ({ undoSession: undoSessionFromMenu }),
+  }, SidebarUndoMenuItem))
 }
 
 interface ClientContext {
@@ -2411,6 +2461,50 @@ function SidebarDeleteMenuItem({ sessionId, displayTitle, useMenuOpenState, dele
       deleteSession(sessionId, displayTitle)
     },
   }, createElement(TrashIcon, { size: 14 }), createElement('span', null, strings.menuDelete))
+}
+
+/** Owner props plus the injected action for the sidebar "undo" row. */
+interface SidebarUndoMenuItemProps {
+  sessionId: string
+  displayTitle: string
+  useMenuOpenState: () => [boolean, (open: boolean) => void]
+  /** Rolls the workspace and the conversation back one user turn. */
+  undoSession: (sessionId: string, title: string) => void
+}
+
+/**
+ * "Undo last turn" row in the official sidebar session menu, right after the
+ * delete row. The host route owns the workspace restore, the fork and the
+ * archive; this row only confirms and refreshes.
+ */
+function SidebarUndoMenuItem({ sessionId, displayTitle, useMenuOpenState, undoSession }: SidebarUndoMenuItemProps): ReactElement {
+  const strings = useLocaleStrings()
+  const [, setMenuOpen] = useMenuOpenState()
+  return createElement('button', {
+    type: 'button',
+    role: 'menuitem',
+    className: 'dsh-session-menu-item',
+    onClick: () => {
+      setMenuOpen(false)
+      undoSession(sessionId, displayTitle)
+    },
+  }, createElement(UndoArrowIcon, null), createElement('span', null, strings.undoTurn))
+}
+
+/** Inline undo arrow (no primitives dependency for a plugin-contributed row). */
+function UndoArrowIcon(): ReactElement {
+  return createElement('svg', {
+    viewBox: '0 0 24 24',
+    width: 14,
+    height: 14,
+    fill: 'none',
+    stroke: 'currentColor',
+    strokeWidth: 1.8,
+    'aria-hidden': true,
+  },
+    createElement('path', { d: 'M9 7L4 12l5 5' }),
+    createElement('path', { d: 'M4 12h9a5 5 0 0 1 0 10h-2' }),
+  )
 }
 
 // ── General-settings preference row: context compaction threshold ──────────
@@ -2917,6 +3011,40 @@ function SessionDrawer({ api, sessions }: DrawerInjected): ReactElement {
     }
   }, [api, sessions, strings, showAlert])
 
+  // Undo the last turn: the host restores the workspace files, forks the
+  // conversation at the previous user message and archives the original; the
+  // fork is opened afterwards.
+  const handleUndo = useCallback(async (sessionId: string, title: string): Promise<void> => {
+    if (!window.confirm(strings.undoConfirm)) return
+    setBusyId(sessionId)
+    try {
+      saveTitle(sessionId, title)
+      const response = await fetch(UNDO_ROUTE, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ sessionId }),
+      })
+      const data = (await response.json().catch(() => ({}))) as UndoResponse
+      if (!response.ok || data.ok !== true) throw new Error(data.error ?? `HTTP ${response.status}`)
+      await Promise.all([load(), refreshTrash()])
+      try {
+        await (sessions as unknown as { refresh?: () => Promise<unknown> }).refresh?.()
+      } catch {
+        // Best-effort; the next list refresh re-baselines anyway.
+      }
+      if (typeof data.sessionId === 'string' && data.sessionId !== '') sessions.open(data.sessionId as SessionId)
+      setDrawer({ open: false })
+      if (typeof data.warning === 'string' && data.warning !== '') showAlert(data.warning)
+    } catch (error) {
+      const code = error instanceof Error ? error.message : ''
+      const friendly = code === 'session-live' ? strings.undoRunning : code === 'no-user-message' ? strings.undoNoMessage : ''
+      const suffix = friendly !== '' ? ` (${friendly})` : code !== '' ? ` (${code})` : ''
+      showAlert(strings.undoFailed + suffix)
+    } finally {
+      setBusyId(null)
+    }
+  }, [load, refreshTrash, sessions, strings, showAlert])
+
   const renderStatsDialog = (): ReactElement | null => {
     if (statsId === null || stats === null) return null
     const sessionTitle = rows?.find((row) => row.sessionId === statsId)?.title ?? statsId
@@ -3081,6 +3209,15 @@ function SessionDrawer({ api, sessions }: DrawerInjected): ReactElement {
               void handleFork(row.sessionId)
             },
           }, strings.fork),
+          createElement('button', {
+            type: 'button',
+            className: 'dsh-delete-session__more-item',
+            disabled: row.running || busy,
+            onClick: () => {
+              setMoreOpenId(null)
+              void handleUndo(row.sessionId, row.title)
+            },
+          }, strings.undoTurn),
           createElement('button', {
             type: 'button',
             className: 'dsh-delete-session__more-item dsh-delete-session__more-item--danger',
